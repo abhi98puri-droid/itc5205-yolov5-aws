@@ -1,0 +1,7 @@
+sample_images/
+events/
+*.md
+client_demo.py
+load_test.py
+ec2_verify_yolov5.py
+__pycache__/

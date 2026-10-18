@@ -1,0 +1,8 @@
+deploy/stack_outputs.env
+.aws-sam/
+deploy/.aws-sam/
+samconfig.toml
+__pycache__/
+*.pyc
+load_test_results.csv
+annotated_output.jpg
