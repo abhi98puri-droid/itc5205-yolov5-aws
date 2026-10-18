@@ -67,7 +67,16 @@ _boto_cfg = Config(
     connect_timeout=5,
     read_timeout=20,
 )
-s3 = boto3.client("s3", config=_boto_cfg)
+# Regional endpoint + SigV4 for pre-signed URLs. The default global endpoint
+# (bucket.s3.amazonaws.com) answers "307 Temporary Redirect" for a new bucket
+# outside us-east-1, and a pre-signed PUT cannot follow that redirect.
+REGION = os.environ.get("AWS_REGION", "ap-southeast-2")
+s3 = boto3.client(
+    "s3",
+    region_name=REGION,
+    endpoint_url=f"https://s3.{REGION}.amazonaws.com",
+    config=_boto_cfg.merge(Config(signature_version="s3v4", s3={"addressing_style": "virtual"})),
+)
 table = boto3.resource("dynamodb", config=_boto_cfg).Table(TABLE_NAME)
 
 # ------------------------------------------------------------------ model ---
