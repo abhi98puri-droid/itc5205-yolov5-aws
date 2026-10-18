@@ -221,7 +221,10 @@ def route_detect(event, ctx):
         data = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
     except ClientError as exc:
         code = exc.response["Error"]["Code"]
-        if code in ("404", "NoSuchKey", "NotFound"):
+        # Without s3:ListBucket, S3 answers HeadObject for a missing key with
+        # 403 instead of 404 (it will not reveal whether the key exists). We keep
+        # least privilege and translate both into a clean 404 for the client.
+        if code in ("404", "NoSuchKey", "NotFound", "403", "AccessDenied", "Forbidden"):
             raise ApiError(404, f"s3://{bucket}/{key} not found.")
         raise
     t_read = time.time()
