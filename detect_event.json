@@ -1,0 +1,9 @@
+{
+  "resource": "/detect",
+  "path": "/detect",
+  "httpMethod": "POST",
+  "headers": {"Content-Type": "application/json"},
+  "pathParameters": null,
+  "body": "{\"key\": \"uploads/bus.jpg\"}",
+  "isBase64Encoded": false
+}

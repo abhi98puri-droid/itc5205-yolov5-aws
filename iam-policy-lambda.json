@@ -1,0 +1,18 @@
+{
+  "_comment": "Inline policy attached to the detector Lambda execution role by template.yaml (account/stack names substituted at deploy time). SAM also attaches the AWS managed policies AWSLambdaBasicExecutionRole (CloudWatch Logs) and AWSXrayWriteOnlyAccess (tracing).",
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Sid": "ReadUploads", "Effect": "Allow", "Action": ["s3:GetObject"],
+      "Resource": "arn:aws:s3:::yolo-detect-images-<ACCOUNT_ID>/uploads/*" },
+    { "Sid": "WriteOutputsAndPresignUploads", "Effect": "Allow", "Action": ["s3:PutObject"],
+      "Resource": ["arn:aws:s3:::yolo-detect-images-<ACCOUNT_ID>/uploads/*",
+                   "arn:aws:s3:::yolo-detect-images-<ACCOUNT_ID>/detected/*",
+                   "arn:aws:s3:::yolo-detect-images-<ACCOUNT_ID>/results/*"] },
+    { "Sid": "PresignDownloadOfOutputs", "Effect": "Allow", "Action": ["s3:GetObject"],
+      "Resource": "arn:aws:s3:::yolo-detect-images-<ACCOUNT_ID>/detected/*" },
+    { "Sid": "DetectionRecords", "Effect": "Allow",
+      "Action": ["dynamodb:PutItem", "dynamodb:GetItem", "dynamodb:Query"],
+      "Resource": ["arn:aws:dynamodb:ap-southeast-2:<ACCOUNT_ID>:table/yolo-detect-detections",
+                   "arn:aws:dynamodb:ap-southeast-2:<ACCOUNT_ID>:table/yolo-detect-detections/index/*"] }
+  ]
+}

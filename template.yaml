@@ -1,0 +1,251 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  ITC5205 Assignment 2 - Image object identification on AWS.
+  YOLOv5 (Lambda container image) behind API Gateway, with S3 for image/JSON
+  storage and DynamoDB for queryable detection records.
+
+Parameters:
+  MemorySize:
+    Type: Number
+    Default: 3008
+    Description: Lambda memory (MB). CPU scales with memory, so this directly drives inference speed.
+  ConfThreshold:
+    Type: String
+    Default: "0.25"
+    Description: YOLOv5 confidence threshold.
+  StageName:
+    Type: String
+    Default: prod
+
+Globals:
+  Function:
+    Timeout: 60
+    Tracing: Active          # X-Ray traces show the Initialization segment on cold starts
+
+Resources:
+  # ------------------------------------------------------------ storage ---
+  ImageBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-images-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      CorsConfiguration:            # allows browser PUTs to pre-signed URLs
+        CorsRules:
+          - AllowedMethods: [PUT, GET]
+            AllowedOrigins: ["*"]
+            AllowedHeaders: ["*"]
+            MaxAge: 3000
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-generated-output
+            Status: Enabled
+            Prefix: detected/
+            ExpirationInDays: 30
+
+  DetectionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-detections"
+      BillingMode: PROVISIONED
+      AttributeDefinitions:
+        - { AttributeName: image_id, AttributeType: S }
+        - { AttributeName: created_date, AttributeType: S }
+        - { AttributeName: created_at, AttributeType: S }
+      KeySchema:
+        - { AttributeName: image_id, KeyType: HASH }
+      GlobalSecondaryIndexes:
+        - IndexName: by-date          # "all detections on a given day, newest first"
+          KeySchema:
+            - { AttributeName: created_date, KeyType: HASH }
+            - { AttributeName: created_at, KeyType: RANGE }
+          Projection:
+            ProjectionType: INCLUDE
+            NonKeyAttributes: [source_key, object_count, label_counts, annotated_key]
+          ProvisionedThroughput: { ReadCapacityUnits: 5, WriteCapacityUnits: 5 }
+      ProvisionedThroughput: { ReadCapacityUnits: 5, WriteCapacityUnits: 5 }
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: false
+
+  # DynamoDB auto-scaling (target tracking at 70% utilisation).
+  # RoleARN omitted -> Application Auto Scaling uses its service-linked role.
+  TableWriteScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      ServiceNamespace: dynamodb
+      ResourceId: !Sub "table/${DetectionsTable}"
+      ScalableDimension: dynamodb:table:WriteCapacityUnits
+      MinCapacity: 5
+      MaxCapacity: 50
+  TableWriteScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub "${AWS::StackName}-wcu-tracking"
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref TableWriteScalingTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 70
+        PredefinedMetricSpecification:
+          PredefinedMetricType: DynamoDBWriteCapacityUtilization
+  TableReadScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      ServiceNamespace: dynamodb
+      ResourceId: !Sub "table/${DetectionsTable}"
+      ScalableDimension: dynamodb:table:ReadCapacityUnits
+      MinCapacity: 5
+      MaxCapacity: 50
+  TableReadScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub "${AWS::StackName}-rcu-tracking"
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref TableReadScalingTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 70
+        PredefinedMetricSpecification:
+          PredefinedMetricType: DynamoDBReadCapacityUtilization
+
+  # ---------------------------------------------------------------- API ---
+  DetectApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub "${AWS::StackName}-api"
+      StageName: !Ref StageName
+      OpenApiVersion: "3.0.1"
+      TracingEnabled: true
+      Auth:
+        ApiKeyRequired: true
+        UsagePlan:
+          CreateUsagePlan: PER_API
+          Description: Throttling + quota for the detection API
+          Throttle:
+            RateLimit: 20
+            BurstLimit: 40
+          Quota:
+            Limit: 5000
+            Period: DAY
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          MetricsEnabled: true
+
+  # ------------------------------------------------------------- compute ---
+  DetectorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-detector"
+      PackageType: Image
+      Architectures: [x86_64]
+      MemorySize: !Ref MemorySize
+      EphemeralStorage:
+        Size: 1024
+      AutoPublishAlias: live
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref ImageBucket
+          TABLE_NAME: !Ref DetectionsTable
+          CONF_THRESHOLD: !Ref ConfThreshold
+          LOG_LEVEL: INFO
+      Policies:
+        - Statement:
+            - Sid: ReadUploads
+              Effect: Allow
+              Action: [s3:GetObject]
+              Resource: !Sub "arn:aws:s3:::${AWS::StackName}-images-${AWS::AccountId}/uploads/*"
+            - Sid: WriteOutputsAndPresignUploads
+              Effect: Allow
+              Action: [s3:PutObject]
+              Resource:
+                - !Sub "arn:aws:s3:::${AWS::StackName}-images-${AWS::AccountId}/uploads/*"
+                - !Sub "arn:aws:s3:::${AWS::StackName}-images-${AWS::AccountId}/detected/*"
+                - !Sub "arn:aws:s3:::${AWS::StackName}-images-${AWS::AccountId}/results/*"
+            - Sid: PresignDownloadOfOutputs
+              Effect: Allow
+              Action: [s3:GetObject]
+              Resource: !Sub "arn:aws:s3:::${AWS::StackName}-images-${AWS::AccountId}/detected/*"
+            - Sid: DetectionRecords
+              Effect: Allow
+              Action: [dynamodb:PutItem, dynamodb:GetItem, dynamodb:Query]
+              Resource:
+                - !GetAtt DetectionsTable.Arn
+                - !Sub "${DetectionsTable.Arn}/index/*"
+      Events:
+        Health:
+          Type: Api
+          Properties:
+            RestApiId: !Ref DetectApi
+            Path: /health
+            Method: get
+            Auth:
+              ApiKeyRequired: false
+        UploadUrl:
+          Type: Api
+          Properties:
+            RestApiId: !Ref DetectApi
+            Path: /upload-url
+            Method: post
+        Detect:
+          Type: Api
+          Properties:
+            RestApiId: !Ref DetectApi
+            Path: /detect
+            Method: post
+        Results:
+          Type: Api
+          Properties:
+            RestApiId: !Ref DetectApi
+            Path: /results/{image_id}
+            Method: get
+    Metadata:
+      DockerContext: ../code
+      Dockerfile: Dockerfile
+      DockerTag: v1
+
+  DetectorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-detector"
+      RetentionInDays: 14
+
+  # Alarm: any 5xx-style function errors
+  DetectorErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Detector Lambda reported errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref DetectorFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  ApiUrl:
+    Description: Base URL of the API (append /health, /upload-url, /detect, /results/{id})
+    Value: !Sub "https://${DetectApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}"
+  ApiKeyId:
+    Description: "Get the key value with: aws apigateway get-api-key --api-key <id> --include-value"
+    Value: !Ref DetectApiApiKey
+  BucketName:
+    Value: !Ref ImageBucket
+  TableName:
+    Value: !Ref DetectionsTable
+  FunctionName:
+    Value: !Ref DetectorFunction
